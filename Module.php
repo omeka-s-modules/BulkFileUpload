@@ -7,15 +7,12 @@ use Laminas\EventManager\SharedEventManagerInterface;
 use Laminas\Mvc\Controller\AbstractController;
 use Laminas\ServiceManager\ServiceLocatorInterface;
 use Laminas\View\Renderer\PhpRenderer;
+use Omeka\Api\Representation\UserRepresentation;
 use Omeka\Module\AbstractModule;
 use Omeka\Stdlib\Message;
 
 class Module extends AbstractModule
 {
-    protected $directory;
-
-    protected $deleteFile;
-
     public function getConfig()
     {
         return include __DIR__ . '/config/module.config.php';
@@ -28,6 +25,11 @@ class Module extends AbstractModule
         $settings->delete('file_sideload_delete_file');
         $settings->delete('file_sideload_max_files');
         $settings->delete('file_sideload_max_directories');
+        $settings->delete('file_sideload_directory_depth_user');
+
+        /** @var \Doctrine\DBAL\Connection $connection */
+        $connection = $serviceLocator->get('Omeka\Connection');
+        $connection->executeStatement('DELETE FROM `user_setting` WHERE `id` LIKE "filesideload#_%" ESCAPE "#";');
     }
 
     public function attachListeners(SharedEventManagerInterface $sharedEventManager): void
@@ -36,6 +38,30 @@ class Module extends AbstractModule
             \Omeka\Api\Adapter\ItemAdapter::class,
             'api.hydrate.pre',
             [$this, 'handleItemApiHydratePre']
+        );
+
+        // Add the user directory setting to the user form.
+        $sharedEventManager->attach(
+            \Omeka\Form\UserForm::class,
+            'form.add_elements',
+            [$this, 'addUserFormElement']
+        );
+        $sharedEventManager->attach(
+            \Omeka\Form\UserForm::class,
+            'form.add_input_filters',
+            [$this, 'addUserFormElementFilter']
+        );
+
+        // Display the user directory in the user show admin pages.
+        $sharedEventManager->attach(
+            'Omeka\Controller\Admin\User',
+            'view.details',
+            [$this, 'viewUserDetails']
+        );
+        $sharedEventManager->attach(
+            'Omeka\Controller\Admin\User',
+            'view.show.after',
+            [$this, 'viewUserShowAfter']
         );
     }
 
@@ -49,6 +75,7 @@ class Module extends AbstractModule
             'delete_file' => $settings->get('file_sideload_delete_file', 'no'),
             'filesideload_max_files' => $settings->get('file_sideload_max_files', 1000),
             'filesideload_max_directories' => $settings->get('file_sideload_max_directories', 1000),
+            'filesideload_directory_depth_user' => $settings->get('file_sideload_directory_depth_user', 2),
         ]);
         return $renderer->formCollection($form, false);
     }
@@ -68,6 +95,7 @@ class Module extends AbstractModule
         $settings->set('file_sideload_delete_file', $formData['delete_file']);
         $settings->set('file_sideload_max_files', (int) $formData['filesideload_max_files']);
         $settings->set('file_sideload_max_directories', (int) $formData['filesideload_max_directories']);
+        $settings->set('file_sideload_directory_depth_user', (int) $formData['filesideload_directory_depth_user']);
         return true;
     }
 
@@ -82,26 +110,27 @@ class Module extends AbstractModule
             return;
         }
 
+        $services = $this->getServiceLocator();
+
         if (is_null($isChecked)) {
             $isChecked = false;
-            $settings = $this->getServiceLocator()->get('Omeka\Settings');
-            $mainDir = (string) $settings->get('file_sideload_directory', '');
-            if (!strlen($mainDir)) {
+            $settings = $services->get('Omeka\Settings');
+            $sideloadDir = (string) $settings->get('file_sideload_directory', '');
+            if (!strlen($sideloadDir)) {
                 return;
             }
 
-            $mainDir = realpath($mainDir);
-            if ($mainDir === false) {
+            $sideloadDir = realpath($sideloadDir);
+            if ($sideloadDir === false) {
                 return;
             }
 
-            $dir = new \SplFileInfo($mainDir);
+            $dir = new \SplFileInfo($sideloadDir);
             if (!$dir->isDir() || !$dir->isReadable() || !$dir->isExecutable()) {
                 return;
             }
 
-            $this->directory = $mainDir;
-            $this->deleteFile = $settings->get('file_sideload_delete_file') === 'yes';
+            $deleteFile = $settings->get('file_sideload_delete_file') === 'yes';
 
             $isChecked = true;
         }
@@ -111,6 +140,9 @@ class Module extends AbstractModule
         }
 
         $errorStore = $event->getParam('errorStore');
+
+        /** @var \FileSideload\FileSideload\FileSystem $fileSystem */
+        $fileSystem = $services->get('FileSideload\FileSystem');
 
         $newDataMedias = [];
         foreach ($data['o:media'] as $dataMedia) {
@@ -140,16 +172,16 @@ class Module extends AbstractModule
                 continue;
             }
 
-            $isAbsolutePathInsideDir = $this->directory && strpos($ingestDirectory, $this->directory) === 0;
+            $isAbsolutePathInsideDir = $sideloadDir && strpos($ingestDirectory, $sideloadDir) === 0;
             $directory = $isAbsolutePathInsideDir
                 ? $ingestDirectory
-                : $this->directory . DIRECTORY_SEPARATOR . $ingestDirectory;
+                : $sideloadDir . DIRECTORY_SEPARATOR . $ingestDirectory;
             $fileinfo = new \SplFileInfo($directory);
-            $directory = $this->verifyFileOrDir($fileinfo, true);
+            $directory = $fileSystem->verifyFileOrDir($fileinfo, true);
 
             if (is_null($directory)) {
                 // Set a clearer message in some cases.
-                if ($this->deleteFile && !$fileinfo->getPathInfo()->isWritable()) {
+                if ($deleteFile && !$fileinfo->getPathInfo()->isWritable()) {
                     $errorStore->addError('ingest_directory', new Message(
                         'Ingest directory "%s" is not writeable but the config requires deletion after upload.', // @translate
                         $ingestDirectory
@@ -168,7 +200,7 @@ class Module extends AbstractModule
                 continue;
             }
 
-            $listFiles = $this->listFiles($directory, !empty($dataMedia['ingest_directory_recursively']));
+            $listFiles = $fileSystem->listFiles($directory, !empty($dataMedia['ingest_directory_recursively']));
             if (!count($listFiles)) {
                 $errorStore->addError('ingest_directory', new Message(
                     'Ingest directory "%s" is empty.',  // @translate
@@ -189,115 +221,159 @@ class Module extends AbstractModule
         $request->setContent($data);
     }
 
-    /**
-     * Get all files available to sideload from a directory inside the main dir.
-     *
-     * @return array List of filepaths relative to the main directory.
-     */
-    protected function listFiles(string $directory, bool $recursive = false): array
+    public function addUserFormElement(Event $event): void
     {
-        $dir = new \SplFileInfo($directory);
-        if (!$dir->isDir() || !$dir->isReadable() || !$dir->isExecutable()) {
-            return [];
-        }
+        /** @var \Omeka\Form\UserForm $form */
+        $form = $event->getTarget();
 
-        // Check if the dir is inside main directory: don't import root files.
-        $directory = $this->verifyFileOrDir($dir, true);
-        if (is_null($directory)) {
-            return [];
-        }
+        /**
+         * @var \Omeka\Entity\User $user
+         * @var \FileSideload\FileSideload\FileSystem $fileSystem
+         */
+        $services = $this->getServiceLocator();
+        $settings = $services->get('Omeka\Settings');
+        $entityManager = $services->get('Omeka\EntityManager');
+        $fileSystem = $services->get('FileSideload\FileSystem');
 
-        $listFiles = [];
+        // The user is not the current user, but the user in the form.
+        // It may be empty for a new user.
+        $userId = $services->get('Application')->getMvcEvent()->getRouteMatch()->getParam('id');
+        $user = $userId ? $entityManager->find(\Omeka\Entity\User::class, $userId) : null;
 
-        // To simplify sort.
-        $listRootFiles = [];
-
-        $lengthDir = strlen($this->directory) + 1;
-        if ($recursive) {
-            $dir = new \RecursiveDirectoryIterator($directory);
-            // Prevent UnexpectedValueException "Permission denied" by excluding
-            // directories that are not executable or readable.
-            $dir = new \RecursiveCallbackFilterIterator($dir, function ($current, $key, $iterator) {
-                if ($iterator->isDir() && (!$iterator->isExecutable() || !$iterator->isReadable())) {
-                    return false;
-                }
-                return true;
-            });
-            $iterator = new \RecursiveIteratorIterator($dir);
-            /** @var \SplFileInfo $file */
-            foreach ($iterator as $filepath => $file) {
-                if ($this->verifyFileOrDir($file)) {
-                    // For security, don't display the full path to the user.
-                    $relativePath = substr($filepath, $lengthDir);
-                    // Use keys for quicker process on big directories.
-                    $listFiles[$relativePath] = null;
-                    if (pathinfo($filepath, PATHINFO_DIRNAME) === $directory) {
-                        $listRootFiles[$relativePath] = null;
-                    }
-                }
-            }
+        // Manage a direct creation (no id).
+        if ($user) {
+            /** @var \Omeka\Settings\UserSettings $userSettings */
+            $userSettings = $services->get('Omeka\Settings\User');
+            $userSettings->setTargetId($userId);
+            $userDir = $userSettings->get('filesideload_user_dir', '');
         } else {
-            $iterator = new \DirectoryIterator($directory);
-            /** @var \DirectoryIterator $file */
-            foreach ($iterator as $file) {
-                $filepath = $this->verifyFileOrDir($file);
-                if (!is_null($filepath)) {
-                    // For security, don't display the full path to the user.
-                    $relativePath = substr($filepath, $lengthDir);
-                    // Use keys for quicker process on big directories.
-                    $listFiles[$relativePath] = null;
-                }
-            }
+            $userDir = '';
         }
 
-        // Don't mix directories and files. List root files, then sub-directories.
-        $listFiles = array_keys($listFiles);
-        natcasesort($listFiles);
-        $listRootFiles = array_keys($listRootFiles);
-        natcasesort($listRootFiles);
-        return array_values(array_unique(array_merge($listRootFiles, $listFiles)));
+        // Default 2 levels because it's the most common case: one level for the
+        // user or institution, and when the first is the institution, a second
+        // for the collections or the users. Maybe 3, but greater depths may
+        // cause issues with big directories.
+        // This option only applies to the user interface anyway.
+        $sideloadDir = (string) $settings->get('file_sideload_directory', '');
+        $hasMainDirectory = $sideloadDir !== '';
+        if ($hasMainDirectory) {
+            $maxDepth = (int) $settings->get('file_sideload_directory_depth_user', 2);
+            $directories = $fileSystem->listDirs($sideloadDir, $maxDepth);
+            $directories = array_combine($directories, $directories);
+        } else {
+            $directories = [];
+        }
+
+        $fieldset = $form->get('user-settings');
+        $fieldset
+            ->add([
+                'name' => 'filesideload_user_dir',
+                'type' => \Laminas\Form\Element\Select::class,
+                'options' => [
+                    'label' => 'User directory', // @translate
+                    'empty_option' => '',
+                    'value_options' => $directories,
+                ],
+                'attributes' => [
+                    'id' => 'filesideload_user_dir',
+                    'value' => $userDir,
+                    'required' => false,
+                    'disabled' => !$hasMainDirectory,
+                    'class' => 'chosen-select',
+                    'data-placeholder' => count($directories)
+                        ? 'Select a sub-directory…' // @translate
+                        : 'No sub-directory in main directory', // @translate
+                ],
+            ]);
     }
 
-    /**
-     * Verify the passed file or directory.
-     *
-     * Working off the "real" base directory and "real" filepath: both must
-     * exist and have sufficient permissions; the filepath must begin with the
-     * base directory path to avoid problems with symlinks; the base directory
-     * must be server-writable to delete the file; and the file must be a
-     * readable regular file or directory.
-     *
-     * @param \SplFileInfo $fileinfo
-     * @return string|null The real file path or null if the file is invalid.
-     */
-    protected function verifyFileOrDir(\SplFileInfo $fileinfo, bool $isDir = false): ?string
+    public function addUserFormElementFilter(Event $event): void
     {
-        if (false === $this->directory) {
-            return null;
+        $form = $event->getTarget();
+        $inputFilter = $form->getInputFilter();
+        $inputFilter->add([
+            'name' => 'filesideload_user_dir',
+            'required' => false,
+            'filters' => [
+                ['name' => 'StringTrim'],
+            ],
+            'validators' => [
+                [
+                    'name' => 'Callback',
+                    'options' => [
+                        'messages' => [
+                            \Laminas\Validator\Callback::INVALID_VALUE => 'The provided sideload directory is not a directory or does not have sufficient permissions.', // @translate
+                        ],
+                        'callback' => [$this, 'userDirectoryIsValid'],
+                    ],
+                ],
+            ],
+        ]);
+    }
+
+    public function userDirectoryIsValid($dir, $context)
+    {
+        // The user directory is not required.
+        if ($dir === '') {
+            return true;
         }
-        $realPath = $fileinfo->getRealPath();
-        if (false === $realPath) {
-            return null;
+        // For security, even if checked via haystack.
+        if (mb_strpos($dir, '..') !== false) {
+            return false;
         }
-        if ($realPath === $this->directory) {
-            return null;
+        // The user directory is stored as a sub-path of the main directory.
+        $sideloadDir = (string) $this->getServiceLocator()->get('Omeka\Settings')->get('file_sideload_directory');
+        if (!strlen($sideloadDir) || !realpath($sideloadDir)) {
+            return false;
         }
-        if (0 !== strpos($realPath, $this->directory)) {
-            return null;
+        $userDirectory = $sideloadDir . DIRECTORY_SEPARATOR . $dir;
+        $dir = new \SplFileInfo($userDirectory);
+        $valid = $dir->isDir() && $dir->isExecutable() && $dir->isReadable();
+        if (isset($context['delete_file']) && 'yes' === $context['delete_file']) {
+            $valid = $valid && $dir->isWritable();
         }
-        if ($this->deleteFile && !$fileinfo->getPathInfo()->isWritable()) {
-            return null;
-        }
-        if (!$fileinfo->isReadable()) {
-            return null;
-        }
-        if ($isDir) {
-            if (!$fileinfo->isDir() || !$fileinfo->isExecutable()) {
-                return null;
-            }
-        } elseif (!$fileinfo->isFile()) {
-            return null;
-        }
-        return $realPath;
+        return $valid;
+    }
+
+    public function viewUserDetails(Event $event): void
+    {
+        $view = $event->getTarget();
+        $user = $view->resource;
+        $html = <<<'HTML'
+<div class="meta-group">
+    <h4>%1$s</h4>
+    <div class="value">%2$s</div>
+</div>
+
+HTML;
+        $this->viewUserData($view, $user, $html);
+    }
+
+    public function viewUserShowAfter(Event $event): void
+    {
+        $view = $event->getTarget();
+        $user = $view->vars()->user;
+        $html = <<<'HTML'
+<div class="property">
+    <dt>%1$s</dt>
+    <dd class="value">%2$s</dd>
+</div>
+
+HTML;
+        $this->viewUserData($view, $user, $html);
+    }
+
+    protected function viewUserData(PhpRenderer $view, UserRepresentation $user, string $html): void
+    {
+        $services = $this->getServiceLocator();
+        $userSettings = $services->get('Omeka\Settings\User');
+        $userSettings->setTargetId($user->id());
+
+        $label = $view->translate('Server directory'); // @translate
+        $userDirectory = $userSettings->get('filesideload_user_dir', '');
+        $userDir = strlen($userDirectory) ? $userDirectory : $view->translate('[root]'); // @translate
+
+        echo sprintf($html, $label, $userDir);
     }
 }

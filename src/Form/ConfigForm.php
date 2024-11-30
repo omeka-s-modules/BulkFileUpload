@@ -13,7 +13,7 @@ class ConfigForm extends Form
             'name' => 'directory',
             'options' => [
                 'label' => 'Sideload directory', // @translate
-                'info' => 'Enter the absolute path to the directory where files to be sideloaded will be added. The directory can be anywhere on your server.', // @translate
+                'info' => 'Enter the absolute path to the directory where files to be sideloaded will be added. The directory can be anywhere on your server. The users may choose any directory inside it as root.', // @translate
             ],
             'attributes' => [
                 'required' => true,
@@ -53,6 +53,17 @@ class ConfigForm extends Form
             ],
             'attributes' => [
                 'id' => 'filesideload-max-directories',
+                'min' => 0,
+            ],
+        ]);
+        $this->add([
+            'type' => 'number',
+            'name' => 'filesideload_directory_depth_user',
+            'options' => [
+                'label' => 'Max directory depth for user setting', // @translate
+            ],
+            'attributes' => [
+                'id' => 'filesideload-directory-depth-user',
                 'min' => 0,
             ],
         ]);

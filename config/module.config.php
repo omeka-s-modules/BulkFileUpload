@@ -4,6 +4,11 @@ namespace FileSideload;
 use Osii\Service\MediaIngesterMapper\MediaIngesterMapperFactory;
 
 return [
+    'service_manager' => [
+        'factories' => [
+            'FileSideload\FileSystem' => Service\FileSystemFactory::class,
+        ],
+    ],
     'media_ingesters' => [
         'factories' => [
             'sideload' => Service\MediaIngesterSideloadFactory::class,

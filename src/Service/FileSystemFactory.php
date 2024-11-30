@@ -2,22 +2,20 @@
 
 namespace FileSideload\Service;
 
-use FileSideload\Media\Ingester\SideloadDir;
+use FileSideload\FileSideload\FileSystem;
 use Interop\Container\ContainerInterface;
 use Laminas\ServiceManager\Factory\FactoryInterface;
 
-class MediaIngesterSideloadDirFactory implements FactoryInterface
+class FileSystemFactory implements FactoryInterface
 {
     public function __invoke(ContainerInterface $services, $requestedName, array $options = null)
     {
         $settings = $services->get('Omeka\Settings');
-        return new SideloadDir(
+        return new FileSystem(
             $settings->get('file_sideload_directory'),
             $settings->get('file_sideload_delete_file') === 'yes',
-            $services->get('Omeka\File\TempFileFactory'),
-            $services->get('Omeka\File\Validator'),
-            $services->get('Omeka\Settings\User')->get('filesideload_user_dir', ''),
-            $services->get('FileSideload\FileSystem')
+            (int) $settings->get('file_sideload_max_directories'),
+            (int) $settings->get('file_sideload_max_files')
         );
     }
 }
